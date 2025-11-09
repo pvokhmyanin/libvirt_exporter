@@ -1,9 +1,39 @@
 # Prometheus libvirt exporter
 
-**Please note:** This repository is currently unmaintained. Due to insufficient time and not using the exporter anymore
-we decided to archive this project.
+This wonderful software was originally authored by great engineers of Kumina(kudos!).
+
+Since it was archived I've had troubles finding or building libvirt-exporter for
+Almalinux 10, and had struggles with other forks as well. Decided I might as well
+try to update it myself and share with others.
+
+Just in case someone out there is as inept as I am 👋
+
+This repository has been forked and slightly updated for ease of use:
+
+- Made use of DigitalOcean's `go-libvirt` instead of `libvirt-go` as I was slightly struggling with the latter one
+- Added error reporting all across exporter
+- Simplified Dockerfile as it was pulling unnecessary dependencies and seemed overcomplicated
+- Composed Makefile to provide simple shortcuts for docker
+- Vendored dependencies
+
+## HowTo
+- Want to know what commands implemented in make?
+    ```bash
+    make help
+    ```
+- Want standalone binary?
+    ```bash
+    make build
+    ```
+- Want to run exporter in docker?
+    ```bash
+    make run
+    ```
+    *Note: it will listen on `0.0.0.0:9177`*
 
 ---
+
+# Original ReadMe for Prometheus libvirt exporter
 
 This repository provides code for a Prometheus metrics exporter
 for [libvirt](https://libvirt.org/). This exporter connects to any

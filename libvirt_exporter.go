@@ -15,14 +15,16 @@ package main
 
 import (
 	"encoding/xml"
+	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 
-	"github.com/kumina/libvirt_exporter/libvirt_schema"
-	"github.com/libvirt/libvirt-go"
+	goLibvirt "github.com/digitalocean/go-libvirt"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/pvokhmyanin/libvirt_exporter/libvirt_schema"
 	"gopkg.in/alecthomas/kingpin.v2"
 )
 
@@ -190,6 +192,100 @@ func NewLibvirtExporter(uri string, exportNovaMetadata bool) (*LibvirtExporter, 
 	}, nil
 }
 
+func (e *LibvirtExporter) reportBlockStatsForDisk(ch chan<- prometheus.Metric, domainLabelValues []string, disk libvirt_schema.Disk, blockStats []goLibvirt.TypedParam) error {
+	for _, blockStat := range blockStats {
+		// Ullong and Llong are the only TypedParams we can encounter here, so this adhoc is sufficient
+		getTypedParamValue := func(tpv goLibvirt.TypedParamValue) (float64, error) {
+			if tpv.D == uint32(goLibvirt.TypedParamUllong) {
+				v, ok := tpv.I.(uint64)
+				if !ok {
+					return 0, fmt.Errorf("type mismatch uint64: %#v", tpv.I)
+				}
+
+				return float64(v), nil
+			}
+
+			if tpv.D == uint32(goLibvirt.TypedParamLlong) {
+				v, ok := tpv.I.(int64)
+				if !ok {
+					return 0, fmt.Errorf("type mismatch int64: %#v", tpv.I)
+				}
+
+				return float64(v), nil
+			}
+
+			return 0, fmt.Errorf("no suitable conversion for ParamType %d", tpv.D)
+		}
+
+		fieldValue, err := getTypedParamValue(blockStat.Value)
+		if err != nil {
+			return fmt.Errorf("field %q failed to convert: %w", blockStat.Field, err)
+		}
+
+		switch blockStat.Field {
+		case "rd_bytes":
+			ch <- prometheus.MustNewConstMetric(
+				e.libvirtDomainBlockRdBytesDesc,
+				prometheus.CounterValue,
+				fieldValue,
+				append(domainLabelValues, disk.Source.File, disk.Target.Device)...)
+
+		case "rd_req":
+			ch <- prometheus.MustNewConstMetric(
+				e.libvirtDomainBlockRdReqDesc,
+				prometheus.CounterValue,
+				fieldValue,
+				append(domainLabelValues, disk.Source.File, disk.Target.Device)...)
+
+		case "rd_total_times":
+			ch <- prometheus.MustNewConstMetric(
+				e.libvirtDomainBlockRdTotalTimesDesc,
+				prometheus.CounterValue,
+				fieldValue/1e9,
+				append(domainLabelValues, disk.Source.File, disk.Target.Device)...)
+
+		case "wr_bytes":
+			ch <- prometheus.MustNewConstMetric(
+				e.libvirtDomainBlockWrBytesDesc,
+				prometheus.CounterValue,
+				fieldValue,
+				append(domainLabelValues, disk.Source.File, disk.Target.Device)...)
+
+		case "wr_req":
+			ch <- prometheus.MustNewConstMetric(
+				e.libvirtDomainBlockWrReqDesc,
+				prometheus.CounterValue,
+				fieldValue,
+				append(domainLabelValues, disk.Source.File, disk.Target.Device)...)
+
+		case "wr_total_times":
+			ch <- prometheus.MustNewConstMetric(
+				e.libvirtDomainBlockWrTotalTimesDesc,
+				prometheus.CounterValue,
+				fieldValue/1e9,
+				append(domainLabelValues, disk.Source.File, disk.Target.Device)...)
+
+		case "flush_operations":
+			ch <- prometheus.MustNewConstMetric(
+				e.libvirtDomainBlockFlushReqDesc,
+				prometheus.CounterValue,
+				fieldValue,
+				append(domainLabelValues, disk.Source.File, disk.Target.Device)...)
+
+		case "flush_total_times":
+
+			ch <- prometheus.MustNewConstMetric(
+				e.libvirtDomainBlockFlushTotalTimesDesc,
+				prometheus.CounterValue,
+				fieldValue/1e9,
+				append(domainLabelValues, disk.Source.File, disk.Target.Device)...)
+
+		}
+	}
+
+	return nil
+}
+
 // Describe returns metadata for all Prometheus metrics that may be exported.
 func (e *LibvirtExporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- e.libvirtUpDesc
@@ -231,18 +327,20 @@ func (e *LibvirtExporter) Collect(ch chan<- prometheus.Metric) {
 // CollectFromLibvirt obtains Prometheus metrics from all domains in a
 // libvirt setup.
 func (e *LibvirtExporter) CollectFromLibvirt(ch chan<- prometheus.Metric) error {
-	conn, err := libvirt.NewConnect(e.uri)
+	uri, err := url.Parse(e.uri)
 	if err != nil {
-		return err
+		return fmt.Errorf("parse URI %q: %w", e.uri, err)
 	}
-	defer conn.Close()
 
-	// Use ListDomains() as opposed to using ListAllDomains(), as
-	// the latter is unsupported when talking to a system using
-	// libvirt 0.9.12 or older.
-	domainIds, err := conn.ListDomains()
+	conn, err := goLibvirt.ConnectToURI(uri)
 	if err != nil {
-		return err
+		return fmt.Errorf("connect to libvirt: %w", err)
+	}
+	defer conn.ConnectClose()
+
+	domainIds, _, err := conn.ConnectListAllDomains(1, goLibvirt.ConnectListDomainsActive|goLibvirt.ConnectListDomainsInactive)
+	if err != nil {
+		return fmt.Errorf("list all domains: %w", err)
 	}
 	// number of domains
 	ch <- prometheus.MustNewConstMetric(
@@ -251,12 +349,11 @@ func (e *LibvirtExporter) CollectFromLibvirt(ch chan<- prometheus.Metric) error 
 		float64(len(domainIds)))
 
 	for _, id := range domainIds {
-		domain, err := conn.LookupDomainById(id)
+		domain, err := conn.DomainLookupByUUID(id.UUID)
 		if err == nil {
-			err = e.CollectDomain(ch, domain)
-			domain.Free()
+			err = e.CollectDomain(ch, conn, domain)
 			if err != nil {
-				return err
+				return fmt.Errorf("collect stats for domain %q: %w", domain.Name, err)
 			}
 		}
 	}
@@ -265,24 +362,20 @@ func (e *LibvirtExporter) CollectFromLibvirt(ch chan<- prometheus.Metric) error 
 }
 
 // CollectDomain extracts Prometheus metrics from a libvirt domain.
-func (e *LibvirtExporter) CollectDomain(ch chan<- prometheus.Metric, domain *libvirt.Domain) error {
+func (e *LibvirtExporter) CollectDomain(ch chan<- prometheus.Metric, conn *goLibvirt.Libvirt, domain goLibvirt.Domain) error {
 	// Decode XML description of domain to get block device names, etc.
-	xmlDesc, err := domain.GetXMLDesc(0)
+	xmlDesc, err := conn.DomainGetXMLDesc(domain, 0)
 	if err != nil {
-		return err
+		return fmt.Errorf("get domain xml config: %w", err)
 	}
 	var desc libvirt_schema.Domain
 	err = xml.Unmarshal([]byte(xmlDesc), &desc)
 	if err != nil {
-		return err
+		return fmt.Errorf("unmarshall domain config %w", err)
 	}
 
-	domainName, err := domain.GetName()
-	if err != nil {
-		return err
-	}
-	var domainUUID = desc.UUID
-
+	domainUUID := desc.UUID
+	domainName := domain.Name
 	// Extract domain label valuies
 	var domainLabelValues []string
 	if e.exportNovaMetadata {
@@ -297,36 +390,43 @@ func (e *LibvirtExporter) CollectDomain(ch chan<- prometheus.Metric, domain *lib
 	}
 
 	// Report domain info.
-	info, err := domain.GetInfo()
+
+	infoState, infoMaxMem, infoMemory, infoNrVirtCpu, infoCpuTime, err := conn.DomainGetInfo(domain)
 	if err != nil {
-		return err
+		return fmt.Errorf("domain get info: %w", err)
 	}
 	ch <- prometheus.MustNewConstMetric(
 		e.libvirtDomainStateCode,
 		prometheus.GaugeValue,
-		float64(info.State),
+		float64(infoState),
 		domainLabelValues...)
 
 	ch <- prometheus.MustNewConstMetric(
 		e.libvirtDomainInfoMaxMemDesc,
 		prometheus.GaugeValue,
-		float64(info.MaxMem)*1024,
+		float64(infoMaxMem)*1024,
 		domainLabelValues...)
 	ch <- prometheus.MustNewConstMetric(
 		e.libvirtDomainInfoMemoryDesc,
 		prometheus.GaugeValue,
-		float64(info.Memory)*1024,
+		float64(infoMemory)*1024,
 		domainLabelValues...)
 	ch <- prometheus.MustNewConstMetric(
 		e.libvirtDomainInfoNrVirtCpuDesc,
 		prometheus.GaugeValue,
-		float64(info.NrVirtCpu),
+		float64(infoNrVirtCpu),
 		domainLabelValues...)
 	ch <- prometheus.MustNewConstMetric(
 		e.libvirtDomainInfoCpuTimeDesc,
 		prometheus.CounterValue,
-		float64(info.CpuTime)/1e9,
+		float64(infoCpuTime)/1e9,
 		domainLabelValues...)
+
+	// Block and Net stats can only be obtained for a running domain, end here for inactive domains
+	state, _, err := conn.DomainGetState(domain, 0)
+	if goLibvirt.DomainState(state) != goLibvirt.DomainRunning && goLibvirt.DomainState(state) != goLibvirt.DomainPaused {
+		return nil
+	}
 
 	// Report block device statistics.
 	for _, disk := range desc.Devices.Disks {
@@ -334,69 +434,20 @@ func (e *LibvirtExporter) CollectDomain(ch chan<- prometheus.Metric, domain *lib
 			continue
 		}
 
-		blockStats, err := domain.BlockStats(disk.Target.Device)
+		_, nParams, err := conn.DomainBlockStatsFlags(domain, disk.Target.Device, 0, 0)
 		if err != nil {
-			return err
+			return fmt.Errorf("get nparam count for block stats %q for disk %q : %w", domain.Name, disk.Target.Device, err)
 		}
 
-		if blockStats.RdBytesSet {
-			ch <- prometheus.MustNewConstMetric(
-				e.libvirtDomainBlockRdBytesDesc,
-				prometheus.CounterValue,
-				float64(blockStats.RdBytes),
-				append(domainLabelValues, disk.Source.File, disk.Target.Device)...)
+		blockStats, _, err := conn.DomainBlockStatsFlags(domain, disk.Target.Device, nParams, 0)
+		if err != nil {
+			return fmt.Errorf("collect block stats %q for disk %q : %w", domain.Name, disk.Target.Device, err)
 		}
-		if blockStats.RdReqSet {
-			ch <- prometheus.MustNewConstMetric(
-				e.libvirtDomainBlockRdReqDesc,
-				prometheus.CounterValue,
-				float64(blockStats.RdReq),
-				append(domainLabelValues, disk.Source.File, disk.Target.Device)...)
+
+		if err := e.reportBlockStatsForDisk(ch, domainLabelValues, disk, blockStats); err != nil {
+			return fmt.Errorf("report block stats %q for disk %q : %w", domain.Name, disk.Target.Device, err)
 		}
-		if blockStats.RdTotalTimesSet {
-			ch <- prometheus.MustNewConstMetric(
-				e.libvirtDomainBlockRdTotalTimesDesc,
-				prometheus.CounterValue,
-				float64(blockStats.RdTotalTimes)/1e9,
-				append(domainLabelValues, disk.Source.File, disk.Target.Device)...)
-		}
-		if blockStats.WrBytesSet {
-			ch <- prometheus.MustNewConstMetric(
-				e.libvirtDomainBlockWrBytesDesc,
-				prometheus.CounterValue,
-				float64(blockStats.WrBytes),
-				append(domainLabelValues, disk.Source.File, disk.Target.Device)...)
-		}
-		if blockStats.WrReqSet {
-			ch <- prometheus.MustNewConstMetric(
-				e.libvirtDomainBlockWrReqDesc,
-				prometheus.CounterValue,
-				float64(blockStats.WrReq),
-				append(domainLabelValues, disk.Source.File, disk.Target.Device)...)
-		}
-		if blockStats.WrTotalTimesSet {
-			ch <- prometheus.MustNewConstMetric(
-				e.libvirtDomainBlockWrTotalTimesDesc,
-				prometheus.CounterValue,
-				float64(blockStats.WrTotalTimes)/1e9,
-				append(domainLabelValues, disk.Source.File, disk.Target.Device)...)
-		}
-		if blockStats.FlushReqSet {
-			ch <- prometheus.MustNewConstMetric(
-				e.libvirtDomainBlockFlushReqDesc,
-				prometheus.CounterValue,
-				float64(blockStats.FlushReq),
-				append(domainLabelValues, disk.Source.File, disk.Target.Device)...)
-		}
-		if blockStats.FlushTotalTimesSet {
-			ch <- prometheus.MustNewConstMetric(
-				e.libvirtDomainBlockFlushTotalTimesDesc,
-				prometheus.CounterValue,
-				float64(blockStats.FlushTotalTimes)/1e9,
-				append(domainLabelValues, disk.Source.File, disk.Target.Device)...)
-		}
-		// Skip "Errs", as the documentation does not clearly
-		// explain what this means.
+
 	}
 
 	// Report network interface statistics.
@@ -404,67 +455,51 @@ func (e *LibvirtExporter) CollectDomain(ch chan<- prometheus.Metric, domain *lib
 		if iface.Target.Device == "" {
 			continue
 		}
-		interfaceStats, err := domain.InterfaceStats(iface.Target.Device)
+		rRxBytes, rRxPackets, rRxErrs, rRxDrop, rTxBytes, rTxPackets, rTxErrs, rTxDrop, err := conn.DomainInterfaceStats(domain, iface.Target.Device)
 		if err != nil {
-			return err
+			return fmt.Errorf("collect network stats %q for interface %q : %w", domain.Name, iface.Target.Device, err)
 		}
 
-		if interfaceStats.RxBytesSet {
-			ch <- prometheus.MustNewConstMetric(
-				e.libvirtDomainInterfaceRxBytesDesc,
-				prometheus.CounterValue,
-				float64(interfaceStats.RxBytes),
-				append(domainLabelValues, iface.Source.Bridge, iface.Target.Device)...)
-		}
-		if interfaceStats.RxPacketsSet {
-			ch <- prometheus.MustNewConstMetric(
-				e.libvirtDomainInterfaceRxPacketsDesc,
-				prometheus.CounterValue,
-				float64(interfaceStats.RxPackets),
-				append(domainLabelValues, iface.Source.Bridge, iface.Target.Device)...)
-		}
-		if interfaceStats.RxErrsSet {
-			ch <- prometheus.MustNewConstMetric(
-				e.libvirtDomainInterfaceRxErrsDesc,
-				prometheus.CounterValue,
-				float64(interfaceStats.RxErrs),
-				append(domainLabelValues, iface.Source.Bridge, iface.Target.Device)...)
-		}
-		if interfaceStats.RxDropSet {
-			ch <- prometheus.MustNewConstMetric(
-				e.libvirtDomainInterfaceRxDropDesc,
-				prometheus.CounterValue,
-				float64(interfaceStats.RxDrop),
-				append(domainLabelValues, iface.Source.Bridge, iface.Target.Device)...)
-		}
-		if interfaceStats.TxBytesSet {
-			ch <- prometheus.MustNewConstMetric(
-				e.libvirtDomainInterfaceTxBytesDesc,
-				prometheus.CounterValue,
-				float64(interfaceStats.TxBytes),
-				append(domainLabelValues, iface.Source.Bridge, iface.Target.Device)...)
-		}
-		if interfaceStats.TxPacketsSet {
-			ch <- prometheus.MustNewConstMetric(
-				e.libvirtDomainInterfaceTxPacketsDesc,
-				prometheus.CounterValue,
-				float64(interfaceStats.TxPackets),
-				append(domainLabelValues, iface.Source.Bridge, iface.Target.Device)...)
-		}
-		if interfaceStats.TxErrsSet {
-			ch <- prometheus.MustNewConstMetric(
-				e.libvirtDomainInterfaceTxErrsDesc,
-				prometheus.CounterValue,
-				float64(interfaceStats.TxErrs),
-				append(domainLabelValues, iface.Source.Bridge, iface.Target.Device)...)
-		}
-		if interfaceStats.TxDropSet {
-			ch <- prometheus.MustNewConstMetric(
-				e.libvirtDomainInterfaceTxDropDesc,
-				prometheus.CounterValue,
-				float64(interfaceStats.TxDrop),
-				append(domainLabelValues, iface.Source.Bridge, iface.Target.Device)...)
-		}
+		ch <- prometheus.MustNewConstMetric(
+			e.libvirtDomainInterfaceRxBytesDesc,
+			prometheus.CounterValue,
+			float64(rRxBytes),
+			append(domainLabelValues, iface.Source.Bridge, iface.Target.Device)...)
+		ch <- prometheus.MustNewConstMetric(
+			e.libvirtDomainInterfaceRxPacketsDesc,
+			prometheus.CounterValue,
+			float64(rRxPackets),
+			append(domainLabelValues, iface.Source.Bridge, iface.Target.Device)...)
+		ch <- prometheus.MustNewConstMetric(
+			e.libvirtDomainInterfaceRxErrsDesc,
+			prometheus.CounterValue,
+			float64(rRxErrs),
+			append(domainLabelValues, iface.Source.Bridge, iface.Target.Device)...)
+		ch <- prometheus.MustNewConstMetric(
+			e.libvirtDomainInterfaceRxDropDesc,
+			prometheus.CounterValue,
+			float64(rRxDrop),
+			append(domainLabelValues, iface.Source.Bridge, iface.Target.Device)...)
+		ch <- prometheus.MustNewConstMetric(
+			e.libvirtDomainInterfaceTxBytesDesc,
+			prometheus.CounterValue,
+			float64(rTxBytes),
+			append(domainLabelValues, iface.Source.Bridge, iface.Target.Device)...)
+		ch <- prometheus.MustNewConstMetric(
+			e.libvirtDomainInterfaceTxPacketsDesc,
+			prometheus.CounterValue,
+			float64(rTxPackets),
+			append(domainLabelValues, iface.Source.Bridge, iface.Target.Device)...)
+		ch <- prometheus.MustNewConstMetric(
+			e.libvirtDomainInterfaceTxErrsDesc,
+			prometheus.CounterValue,
+			float64(rTxErrs),
+			append(domainLabelValues, iface.Source.Bridge, iface.Target.Device)...)
+		ch <- prometheus.MustNewConstMetric(
+			e.libvirtDomainInterfaceTxDropDesc,
+			prometheus.CounterValue,
+			float64(rTxDrop),
+			append(domainLabelValues, iface.Source.Bridge, iface.Target.Device)...)
 	}
 
 	return nil
