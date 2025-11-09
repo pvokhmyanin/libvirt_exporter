@@ -23,7 +23,7 @@ This repository has been forked and slightly updated for ease of use:
     ```
 - Want standalone binary?
     ```bash
-    make build
+    make binary
     ```
 - Want to run exporter in docker?
     ```bash
@@ -33,7 +33,7 @@ This repository has been forked and slightly updated for ease of use:
 
 ---
 
-# Original ReadMe for Prometheus libvirt exporter
+# Original README for Prometheus libvirt exporter
 
 This repository provides code for a Prometheus metrics exporter
 for [libvirt](https://libvirt.org/). This exporter connects to any
